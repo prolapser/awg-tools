@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       force_tag:
-        description: 'Принудительно собрать конкретный тег (например v1.0.0)'
+        description: 'Принудительно собрать конкретный тег (например v1.0.20260223)'
         required: false
         default: ''
 
@@ -26,7 +26,7 @@ jobs:
 
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
@@ -85,10 +85,12 @@ jobs:
           fi
 
   # ─────────────────────────────────────────────
-  # 2. Сборка (только Linux, нативная + кросс)
+  # 2a. Сборка Linux — нативно в контейнерах
+  #     Контейнеры дают правильные системные
+  #     заголовки без кросс-компиляторов
   # ─────────────────────────────────────────────
-  build:
-    name: Build linux-${{ matrix.arch_label }}
+  build-linux:
+    name: Build ${{ matrix.artifact_name }}
     needs: check-new-tag
     if: needs.check-new-tag.outputs.should_build == 'true'
     runs-on: ubuntu-latest
@@ -97,35 +99,102 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - arch_label: x64
-            cc: gcc
-            # Никаких дополнительных пакетов — родная сборка
+          # Ubuntu — стандартный glibc, совместим с большинством дистрибутивов
+          - artifact_name: linux-ubuntu-x64
+            container: ubuntu:22.04
+            install_cmd: apt-get update -q && apt-get install -y build-essential
 
-          - arch_label: x86
-            cc: gcc
-            # -m32 через CFLAGS, нужен пакет gcc-multilib
-            extra_packages: gcc-multilib
-            cflags: -m32
-            ldflags: -m32
+          # Alpine — musl libc, статичная линковка, идеален для embedded/минимальных систем
+          - artifact_name: linux-alpine-x64
+            container: alpine:3.19
+            install_cmd: apk add --no-cache linux-headers build-base
 
-          - arch_label: arm64
-            cc: aarch64-linux-gnu-gcc
-            extra_packages: gcc-aarch64-linux-gnu
-
-          - arch_label: arm
-            cc: arm-linux-gnueabihf-gcc
-            extra_packages: gcc-arm-linux-gnueabihf
+          # ARM64 через Alpine: используем многоарочный образ
+          - artifact_name: linux-alpine-arm64
+            container: arm64v8/alpine:3.19
+            install_cmd: apk add --no-cache linux-headers build-base
+            runs_on: ubuntu-24.04-arm  # нативный ARM runner GitHub
 
     env:
-      TAG:      ${{ needs.check-new-tag.outputs.new_tag }}
-      APP_NAME: amneziawg-tools
+      TAG: ${{ needs.check-new-tag.outputs.new_tag }}
+
+    container:
+      image: ${{ matrix.container }}
+
+    # Переопределяем runner для ARM-таргета
+    # (matrix не позволяет менять runs-on напрямую — используем стандартный runner
+    #  и QEMU для ARM-контейнеров, см. шаг ниже)
 
     steps:
-      - name: Install cross-compiler
-        if: matrix.extra_packages != ''
+      - name: Install dependencies
+        run: ${{ matrix.install_cmd }}
+
+      - name: Clone upstream source at tag ${{ env.TAG }}
         run: |
-          sudo apt-get update -q
-          sudo apt-get install -y ${{ matrix.extra_packages }}
+          # git может отсутствовать в минимальных образах
+          if command -v apt-get &>/dev/null; then
+            apt-get install -y git
+          elif command -v apk &>/dev/null; then
+            apk add --no-cache git
+          fi
+
+          git clone --depth 1 --branch "$TAG" \
+            https://github.com/amnezia-vpn/amneziawg-tools.git src
+
+      - name: Build
+        working-directory: src/src
+        run: |
+          make -j"$(nproc)" \
+            WITH_BASHCOMPLETION=no \
+            WITH_WGQUICK=no \
+            WITH_SYSTEMDUNITS=no
+
+          echo "--- собранные файлы ---"
+          ls -lh
+
+      - name: Collect and package
+        working-directory: src/src
+        run: |
+          mkdir staging
+          cp wg staging/awg
+          # awg-quick — bash-скрипт, берём linux-версию
+          cp wg-quick/linux.bash staging/awg-quick
+
+          ARCHIVE="${{ matrix.artifact_name }}.tar.gz"
+          # tar может не поддерживать -C в alpine, используем cd
+          cd staging && tar -czf "../$ARCHIVE" . && cd ..
+
+          ls -lh "$ARCHIVE"
+          echo "ARCHIVE_PATH=src/src/$ARCHIVE" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ env.ARCHIVE_PATH }}
+          retention-days: 1
+
+  # ─────────────────────────────────────────────
+  # 2b. ARM64 Linux — нативный ARM runner + Alpine
+  #     Отдельный job т.к. нужен другой runs-on
+  # ─────────────────────────────────────────────
+  build-linux-arm64:
+    name: Build linux-alpine-arm64
+    needs: check-new-tag
+    if: needs.check-new-tag.outputs.should_build == 'true'
+    # Нативный ARM64 runner — без QEMU, быстро и надёжно
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: alpine:3.19
+
+    env:
+      TAG: ${{ needs.check-new-tag.outputs.new_tag }}
+
+    steps:
+      - name: Install dependencies
+        run: apk add --no-cache linux-headers build-base git
 
       - name: Clone upstream source at tag ${{ env.TAG }}
         run: |
@@ -136,43 +205,105 @@ jobs:
         working-directory: src/src
         run: |
           make -j"$(nproc)" \
-            CC="${{ matrix.cc }}" \
-            CFLAGS="${{ matrix.cflags }}" \
-            LDFLAGS="${{ matrix.ldflags }}" \
             WITH_BASHCOMPLETION=no \
             WITH_WGQUICK=no \
             WITH_SYSTEMDUNITS=no
 
-          echo "--- собранные бинарники ---"
-          ls -lh awg awg-quick 2>/dev/null || ls -lh
+          ls -lh
 
-      - name: Collect binaries
+      - name: Collect and package
         working-directory: src/src
         run: |
-          STAGING="staging"
-          mkdir "$STAGING"
+          mkdir staging
+          cp wg staging/awg
+          cp wg-quick/linux.bash staging/awg-quick
 
-          # Копируем основные бинарники (awg обязателен, awg-quick — bash-скрипт)
-          cp awg "$STAGING/"
-          [ -f awg-quick ] && cp awg-quick "$STAGING/" || true
-
-          ls -lh "$STAGING"
-
-      - name: Package artifact
-        working-directory: src/src
-        run: |
-          ARCHIVE="${APP_NAME}-linux-${{ matrix.arch_label }}.tar.gz"
-          tar -czf "$ARCHIVE" -C staging .
-          echo "ARCHIVE_PATH=src/src/$ARCHIVE" >> "$GITHUB_ENV"
-          ls -lh "$ARCHIVE"
+          cd staging && tar -czf "../linux-alpine-arm64.tar.gz" . && cd ..
+          ls -lh linux-alpine-arm64.tar.gz
+          echo "ARCHIVE_PATH=src/src/linux-alpine-arm64.tar.gz" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
-          name: ${{ env.APP_NAME }}-linux-${{ matrix.arch_label }}
+          name: linux-alpine-arm64
           path: ${{ env.ARCHIVE_PATH }}
+          retention-days: 1
+
+  # ─────────────────────────────────────────────
+  # 2c. Windows — нативная сборка через build.cmd
+  # ─────────────────────────────────────────────
+  build-windows:
+    name: Build windows
+    needs: check-new-tag
+    if: needs.check-new-tag.outputs.should_build == 'true'
+    runs-on: windows-latest
+
+    env:
+      TAG: ${{ needs.check-new-tag.outputs.new_tag }}
+
+    steps:
+      - name: Clone upstream source at tag ${{ env.TAG }}
+        run: |
+          git clone --depth 1 --branch "$env:TAG" `
+            https://github.com/amnezia-vpn/amneziawg-tools.git src
+
+      - name: Build via build.cmd
+        working-directory: src
+        run: cmd /c build.cmd
+
+      - name: Collect and package
+        shell: bash
+        working-directory: src
+        run: |
+          mkdir -p staging
+
+          # build.cmd кладёт результаты в x64/ x86/ arm64/
+          for arch in x64 x86 arm64; do
+            if [ -d "$arch" ]; then
+              mkdir -p "staging/$arch"
+              cp "$arch"/*.exe "staging/$arch/" 2>/dev/null || true
+              echo "Скопировано из $arch/:"
+              ls -lh "staging/$arch/"
+            else
+              echo "::warning::Директория $arch/ не найдена"
+            fi
+          done
+
+          # Три отдельных архива — по одному на архитектуру
+          for arch in x64 x86 arm64; do
+            if [ -d "staging/$arch" ]; then
+              zip -j "windows-${arch}.zip" staging/$arch/*.exe
+              ls -lh "windows-${arch}.zip"
+            fi
+          done
+
+      - name: Upload windows-x64
+        uses: actions/upload-artifact@v7
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          name: windows-x64
+          path: src/windows-x64.zip
+          retention-days: 1
+
+      - name: Upload windows-x86
+        uses: actions/upload-artifact@v7
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          name: windows-x86
+          path: src/windows-x86.zip
+          retention-days: 1
+
+      - name: Upload windows-arm64
+        uses: actions/upload-artifact@v7
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+        with:
+          name: windows-arm64
+          path: src/windows-arm64.zip
           retention-days: 1
 
   # ─────────────────────────────────────────────
@@ -180,26 +311,29 @@ jobs:
   # ─────────────────────────────────────────────
   release:
     name: Create GitHub Release
-    needs: [check-new-tag, build]
+    needs: [check-new-tag, build-linux, build-linux-arm64, build-windows]
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.check-new-tag.outputs.new_tag }}
 
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           path: dist/
           merge-multiple: true
+
+      - name: Show collected artifacts
+        run: ls -lhR dist/
 
       - name: Generate checksums (SHA256)
         run: |
@@ -217,20 +351,29 @@ jobs:
 
           Автоматическая сборка из upstream-тега [$TAG](https://github.com/amnezia-vpn/amneziawg-tools/releases/tag/$TAG).
 
-          > macOS и Windows не включены: утилиты являются POSIX-специфичными
-          > и предназначены исключительно для Linux.
+          ### Linux
+          Два варианта сборки на выбор:
+          - **ubuntu** — glibc, совместим с Ubuntu/Debian/CentOS и большинством дистрибутивов
+          - **alpine** — musl libc, минимальные зависимости, подходит для контейнеров и embedded
 
-          ### Платформы
-          | ОС    | Архитектура | Файл |
-          |-------|-------------|------|
-          | Linux | x64         | \`amneziawg-tools-linux-x64.tar.gz\` |
-          | Linux | x86         | \`amneziawg-tools-linux-x86.tar.gz\` |
-          | Linux | arm64       | \`amneziawg-tools-linux-arm64.tar.gz\` |
-          | Linux | arm (v7)    | \`amneziawg-tools-linux-arm.tar.gz\` |
+          | ОС    | Libc   | Архитектура | Файл |
+          |-------|--------|-------------|------|
+          | Linux | glibc  | x64         | \`linux-ubuntu-x64.tar.gz\` |
+          | Linux | musl   | x64         | \`linux-alpine-x64.tar.gz\` |
+          | Linux | musl   | arm64       | \`linux-alpine-arm64.tar.gz\` |
 
-          ### Содержимое архивов
+          ### Windows
+          Собрано через нативный \`build.cmd\` из репозитория.
+
+          | ОС      | Архитектура | Файл |
+          |---------|-------------|------|
+          | Windows | x64         | \`windows-x64.zip\` |
+          | Windows | x86         | \`windows-x86.zip\` |
+          | Windows | arm64       | \`windows-arm64.zip\` |
+
+          ### Содержимое Linux-архивов
           - \`awg\` — основной инструмент управления AmneziaWG
-          - \`awg-quick\` — скрипт быстрой настройки интерфейса (если применимо)
+          - \`awg-quick\` — скрипт быстрой настройки интерфейса
 
           > SHA256-суммы всех файлов — в \`SHA256SUMS.txt\`" \
             dist/*
