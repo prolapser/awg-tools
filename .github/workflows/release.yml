@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       force_tag:
-        description: 'Принудительно собрать конкретный тег (например v1.0.20260223)'
+        description: 'Принудительно собрать конкретный тег (например v1.0.0)'
         required: false
         default: ''
 
@@ -26,7 +26,7 @@ jobs:
 
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
@@ -85,11 +85,12 @@ jobs:
           fi
 
   # ─────────────────────────────────────────────
-  # 2a. Сборка Linux — нативно в контейнерах
-  #     Контейнеры дают правильные системные
-  #     заголовки без кросс-компиляторов
+  # 2a. Linux x64 — в контейнерах (ubuntu + alpine)
+  #     actions/upload-artifact работает только
+  #     с glibc, поэтому Alpine-контейнер используем
+  #     только для сборки, а upload идёт на хосте
   # ─────────────────────────────────────────────
-  build-linux:
+  build-linux-x64:
     name: Build ${{ matrix.artifact_name }}
     needs: check-new-tag
     if: needs.check-new-tag.outputs.should_build == 'true'
@@ -99,21 +100,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Ubuntu — стандартный glibc, совместим с большинством дистрибутивов
           - artifact_name: linux-ubuntu-x64
             container: ubuntu:22.04
-            install_cmd: apt-get update -q && apt-get install -y build-essential
+            install_cmd: apt-get update -q && apt-get install -y build-essential git
 
-          # Alpine — musl libc, статичная линковка, идеален для embedded/минимальных систем
           - artifact_name: linux-alpine-x64
             container: alpine:3.19
-            install_cmd: apk add --no-cache linux-headers build-base
-
-          # ARM64 через Alpine: используем многоарочный образ
-          - artifact_name: linux-alpine-arm64
-            container: arm64v8/alpine:3.19
-            install_cmd: apk add --no-cache linux-headers build-base
-            runs_on: ubuntu-24.04-arm  # нативный ARM runner GitHub
+            install_cmd: apk add --no-cache linux-headers build-base git
 
     env:
       TAG: ${{ needs.check-new-tag.outputs.new_tag }}
@@ -121,23 +114,12 @@ jobs:
     container:
       image: ${{ matrix.container }}
 
-    # Переопределяем runner для ARM-таргета
-    # (matrix не позволяет менять runs-on напрямую — используем стандартный runner
-    #  и QEMU для ARM-контейнеров, см. шаг ниже)
-
     steps:
       - name: Install dependencies
         run: ${{ matrix.install_cmd }}
 
       - name: Clone upstream source at tag ${{ env.TAG }}
         run: |
-          # git может отсутствовать в минимальных образах
-          if command -v apt-get &>/dev/null; then
-            apt-get install -y git
-          elif command -v apk &>/dev/null; then
-            apk add --no-cache git
-          fi
-
           git clone --depth 1 --branch "$TAG" \
             https://github.com/amnezia-vpn/amneziawg-tools.git src
 
@@ -152,49 +134,46 @@ jobs:
           echo "--- собранные файлы ---"
           ls -lh
 
-      - name: Collect and package
+      - name: Package
         working-directory: src/src
         run: |
           mkdir staging
           cp wg staging/awg
-          # awg-quick — bash-скрипт, берём linux-версию
           cp wg-quick/linux.bash staging/awg-quick
 
           ARCHIVE="${{ matrix.artifact_name }}.tar.gz"
-          # tar может не поддерживать -C в alpine, используем cd
-          cd staging && tar -czf "../$ARCHIVE" . && cd ..
-
+          tar -czf "$ARCHIVE" -C staging .
           ls -lh "$ARCHIVE"
-          echo "ARCHIVE_PATH=src/src/$ARCHIVE" >> "$GITHUB_ENV"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           name: ${{ matrix.artifact_name }}
-          path: ${{ env.ARCHIVE_PATH }}
+          path: src/src/${{ matrix.artifact_name }}.tar.gz
           retention-days: 1
 
   # ─────────────────────────────────────────────
-  # 2b. ARM64 Linux — нативный ARM runner + Alpine
-  #     Отдельный job т.к. нужен другой runs-on
+  # 2b. Linux ARM64 — нативный ARM runner
+  #     Не используем контейнер: actions/upload-artifact
+  #     не работает в Alpine/musl на ARM.
+  #     Ставим зависимости прямо на ubuntu-24.04-arm.
   # ─────────────────────────────────────────────
   build-linux-arm64:
-    name: Build linux-alpine-arm64
+    name: Build linux-ubuntu-arm64
     needs: check-new-tag
     if: needs.check-new-tag.outputs.should_build == 'true'
-    # Нативный ARM64 runner — без QEMU, быстро и надёжно
     runs-on: ubuntu-24.04-arm
-    container:
-      image: alpine:3.19
 
     env:
       TAG: ${{ needs.check-new-tag.outputs.new_tag }}
 
     steps:
       - name: Install dependencies
-        run: apk add --no-cache linux-headers build-base git
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y build-essential git
 
       - name: Clone upstream source at tag ${{ env.TAG }}
         run: |
@@ -209,30 +188,31 @@ jobs:
             WITH_WGQUICK=no \
             WITH_SYSTEMDUNITS=no
 
+          echo "--- собранные файлы ---"
           ls -lh
 
-      - name: Collect and package
+      - name: Package
         working-directory: src/src
         run: |
           mkdir staging
           cp wg staging/awg
           cp wg-quick/linux.bash staging/awg-quick
 
-          cd staging && tar -czf "../linux-alpine-arm64.tar.gz" . && cd ..
-          ls -lh linux-alpine-arm64.tar.gz
-          echo "ARCHIVE_PATH=src/src/linux-alpine-arm64.tar.gz" >> "$GITHUB_ENV"
+          tar -czf linux-ubuntu-arm64.tar.gz -C staging .
+          ls -lh linux-ubuntu-arm64.tar.gz
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
-          name: linux-alpine-arm64
-          path: ${{ env.ARCHIVE_PATH }}
+          name: linux-ubuntu-arm64
+          path: src/src/linux-ubuntu-arm64.tar.gz
           retention-days: 1
 
   # ─────────────────────────────────────────────
   # 2c. Windows — нативная сборка через build.cmd
+  #     zip отсутствует → используем PowerShell
   # ─────────────────────────────────────────────
   build-windows:
     name: Build windows
@@ -253,34 +233,34 @@ jobs:
         working-directory: src
         run: cmd /c build.cmd
 
-      - name: Collect and package
-        shell: bash
+      - name: Show build results
         working-directory: src
+        shell: pwsh
         run: |
-          mkdir -p staging
+          foreach ($arch in @("x64", "x86", "arm64")) {
+            if (Test-Path $arch) {
+              Write-Host "--- $arch ---"
+              Get-ChildItem $arch | Format-Table Name, Length
+            } else {
+              Write-Warning "Директория $arch не найдена"
+            }
+          }
 
-          # build.cmd кладёт результаты в x64/ x86/ arm64/
-          for arch in x64 x86 arm64; do
-            if [ -d "$arch" ]; then
-              mkdir -p "staging/$arch"
-              cp "$arch"/*.exe "staging/$arch/" 2>/dev/null || true
-              echo "Скопировано из $arch/:"
-              ls -lh "staging/$arch/"
-            else
-              echo "::warning::Директория $arch/ не найдена"
-            fi
-          done
-
-          # Три отдельных архива — по одному на архитектуру
-          for arch in x64 x86 arm64; do
-            if [ -d "staging/$arch" ]; then
-              zip -j "windows-${arch}.zip" staging/$arch/*.exe
-              ls -lh "windows-${arch}.zip"
-            fi
-          done
+      - name: Package with PowerShell
+        working-directory: src
+        shell: pwsh
+        run: |
+          foreach ($arch in @("x64", "x86", "arm64")) {
+            if (Test-Path $arch) {
+              $archive = "windows-${arch}.zip"
+              Compress-Archive -Path "$arch\*" -DestinationPath $archive -Force
+              $size = (Get-Item $archive).Length / 1KB
+              Write-Host "Создан $archive ($([math]::Round($size, 1)) KB)"
+            }
+          }
 
       - name: Upload windows-x64
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
@@ -289,7 +269,7 @@ jobs:
           retention-days: 1
 
       - name: Upload windows-x86
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
@@ -298,7 +278,7 @@ jobs:
           retention-days: 1
 
       - name: Upload windows-arm64
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v4
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
@@ -311,21 +291,21 @@ jobs:
   # ─────────────────────────────────────────────
   release:
     name: Create GitHub Release
-    needs: [check-new-tag, build-linux, build-linux-arm64, build-windows]
+    needs: [check-new-tag, build-linux-x64, build-linux-arm64, build-windows]
     runs-on: ubuntu-latest
     env:
       TAG: ${{ needs.check-new-tag.outputs.new_tag }}
 
     steps:
       - name: Checkout this repo
-        uses: actions/checkout@v6
+        uses: actions/checkout@v4
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@v4
         env:
           FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
         with:
@@ -352,24 +332,18 @@ jobs:
           Автоматическая сборка из upstream-тега [$TAG](https://github.com/amnezia-vpn/amneziawg-tools/releases/tag/$TAG).
 
           ### Linux
-          Два варианта сборки на выбор:
-          - **ubuntu** — glibc, совместим с Ubuntu/Debian/CentOS и большинством дистрибутивов
-          - **alpine** — musl libc, минимальные зависимости, подходит для контейнеров и embedded
-
-          | ОС    | Libc   | Архитектура | Файл |
-          |-------|--------|-------------|------|
-          | Linux | glibc  | x64         | \`linux-ubuntu-x64.tar.gz\` |
-          | Linux | musl   | x64         | \`linux-alpine-x64.tar.gz\` |
-          | Linux | musl   | arm64       | \`linux-alpine-arm64.tar.gz\` |
+          | Libc  | Архитектура | Файл |
+          |-------|-------------|------|
+          | glibc | x64         | \`linux-ubuntu-x64.tar.gz\` |
+          | glibc | arm64       | \`linux-ubuntu-arm64.tar.gz\` |
+          | musl  | x64         | \`linux-alpine-x64.tar.gz\` |
 
           ### Windows
-          Собрано через нативный \`build.cmd\` из репозитория.
-
-          | ОС      | Архитектура | Файл |
-          |---------|-------------|------|
-          | Windows | x64         | \`windows-x64.zip\` |
-          | Windows | x86         | \`windows-x86.zip\` |
-          | Windows | arm64       | \`windows-arm64.zip\` |
+          | Архитектура | Файл |
+          |-------------|------|
+          | x64         | \`windows-x64.zip\` |
+          | x86         | \`windows-x86.zip\` |
+          | arm64       | \`windows-arm64.zip\` |
 
           ### Содержимое Linux-архивов
           - \`awg\` — основной инструмент управления AmneziaWG
